@@ -1,5 +1,12 @@
 <p align="center"><img src="assets/banner.png" alt="hardline" width="100%"></p>
 
+<p align="center">
+  <a href="https://github.com/luxend1337/hardline/stargazers"><img src="https://img.shields.io/github/stars/luxend1337/hardline?style=flat-square&color=f85149" alt="stars"></a>
+  <a href="https://github.com/luxend1337/hardline/releases"><img src="https://img.shields.io/github/v/release/luxend1337/hardline?style=flat-square&color=f85149" alt="release"></a>
+  <a href="https://github.com/luxend1337/hardline/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/luxend1337/hardline/ci.yml?style=flat-square&label=build" alt="build"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/luxend1337/hardline?style=flat-square" alt="license"></a>
+</p>
+
 hardline takes a fresh VPS from "root with a password on port 22" to something
 you can leave on the internet. It's one bash script that asks before every
 change, and at the end it shows you what was open before and what is closed now.
