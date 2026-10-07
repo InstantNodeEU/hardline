@@ -772,6 +772,251 @@ step_ssh() {
 	fi
 }
 
+# ---------------------------------------------------------------- firewall
+
+# "80, 443 51820/udp 8000-8100" -> "80/tcp 443/tcp 51820/udp 8000-8100/tcp"
+parse_ports() {
+	local p out=()
+	for p in ${1//,/ }; do
+		[[ $p == */* ]] || p="$p/tcp"
+		if [[ ! $p =~ ^[0-9]+(-[0-9]+)?/(tcp|udp)$ ]]; then
+			warn "ignoring invalid port: $p"
+			continue
+		fi
+		out+=("$p")
+	done
+	printf '%s' "${out[*]}"
+}
+
+nft_main_conf() {
+	case $FAMILY in
+		rhel) echo /etc/sysconfig/nftables.conf ;;
+		alpine) echo /etc/nftables.nft ;;
+		*) echo /etc/nftables.conf ;;
+	esac
+}
+
+nft_ruleset() {
+	local tcp=() udp=() p
+	for p in "$@"; do
+		case $p in
+			*/tcp) tcp+=("${p%/tcp}") ;;
+			*/udp) udp+=("${p%/udp}") ;;
+		esac
+	done
+	cat <<EOF
+#!/usr/sbin/nft -f
+# written by hardline. Edit, then load with: nft -f $NFT_RULES
+#
+# Only the input hook is filtered. Forwarded traffic (docker, vms) is left
+# alone, so published docker ports are not covered by these rules.
+
+table inet hardline
+delete table inet hardline
+
+table inet hardline {
+	chain input {
+		type filter hook input priority 0; policy drop;
+
+		ct state established,related accept
+		ct state invalid drop
+		iif lo accept
+
+		meta l4proto { icmp, icmpv6 } accept
+
+EOF
+	((${#tcp[@]})) && printf '\t\ttcp dport { %s } accept\n' "$(IFS=,; echo "${tcp[*]}" | sed 's/,/, /g')"
+	((${#udp[@]})) && printf '\t\tudp dport { %s } accept\n' "$(IFS=,; echo "${udp[*]}" | sed 's/,/, /g')"
+	printf '\t}\n}\n'
+}
+
+# Load the rules and give the user a minute to confirm they can still get
+# in. Without an answer the table is removed again.
+nft_apply() {
+	local timer ans
+	run nft -f "$NFT_RULES" || return 1
+	[[ $ASSUME_YES = 1 || $DRY_RUN = 1 ]] && return 0
+
+	( sleep 60; nft delete table inet hardline 2>/dev/null ) &
+	timer=$!
+	echo
+	say "  Firewall is live. Open a NEW ssh connection to check you can still get in."
+	printf 'Still able to connect? (rolls back in 60s) [y/N] ' >/dev/tty
+	read -r -t 60 ans </dev/tty || ans=""
+	kill "$timer" 2>/dev/null || true
+	wait "$timer" 2>/dev/null || true
+	if [[ ${ans,,} == y* ]]; then
+		return 0
+	fi
+	echo
+	nft delete table inet hardline 2>/dev/null || true
+	warn "firewall rolled back"
+	return 1
+}
+
+step_firewall() {
+	step "Firewall"
+	local state detected extra ports p
+	state=$(firewall_state)
+	detected=$(listening_ports)
+	[[ -n $detected ]] && say "  listening right now: $detected"
+
+	if [[ -n $OPT_ALLOW ]]; then
+		extra=$OPT_ALLOW
+	else
+		extra=$(prompt "  ports to allow besides ssh, e.g. 80,443,51820/udp (empty for none)" "")
+	fi
+	ports="$SSH_PORT/tcp $(parse_ports "$extra")"
+	ports=$(tr ' ' '\n' <<<"$ports" | grep -v '^$' | sort -u | sort -t/ -k1,1n | paste -sd' ' -)
+	say "  allowing: $ports"
+
+	if [[ $state = none ]] && command -v ufw >/dev/null 2>&1 && [[ $ASSUME_YES = 0 ]]; then
+		ask "  ufw is installed but inactive. Use ufw instead of plain nftables?" y && state=ufw
+	fi
+	if [[ $state = nftables ]] && ! nft list table inet hardline >/dev/null 2>&1; then
+		warn "there is already an nftables ruleset with a drop policy"
+		ask "  Add the hardline table anyway?" n || return 0
+	fi
+
+	case $state in
+		ufw)
+			ask "Configure ufw?" y || return 0
+			run ufw default deny incoming
+			run ufw default allow outgoing
+			for p in $ports; do run ufw allow "${p/-/:}"; done
+			run ufw --force enable || return 1
+			;;
+		firewalld)
+			ask "Add the ports to firewalld?" y || return 0
+			for p in $ports; do run firewall-cmd --permanent --add-port="$p"; done
+			run firewall-cmd --reload || return 1
+			;;
+		iptables)
+			warn "iptables INPUT policy is already DROP, leaving it alone"
+			warn "make sure these are open: $ports"
+			return 0
+			;;
+		*)
+			ask "Set up nftables (drop everything inbound except the above)?" y || return 0
+			pkg_install nftables || return 1
+			# shellcheck disable=SC2086
+			put_file "$NFT_RULES" 600 < <(nft_ruleset $ports)
+			nft_apply || return 1
+			put_file "$(nft_main_conf)" 755 <<EOF
+#!/usr/sbin/nft -f
+# hardline keeps its rules in its own table so docker and others are untouched
+include "$NFT_RULES"
+EOF
+			svc enable nftables || true
+			;;
+	esac
+	ok "firewall active, open: $ports"
+}
+
+# ---------------------------------------------------------------- brute force
+
+f2b_banaction() {
+	case $(firewall_state) in
+		ufw) echo ufw ;;
+		firewalld) echo firewallcmd-rich-rules ;;
+		iptables) echo iptables-multiport ;;
+		*) echo nftables-multiport ;;
+	esac
+}
+
+setup_fail2ban() {
+	local backend="" logpath="" action allports="" pkgs=(fail2ban)
+	if [[ $FAMILY = rhel && $OS_ID != fedora ]] && ! pkg_has epel-release; then
+		pkg_install epel-release || { warn "fail2ban needs EPEL, enable it and run again"; return 1; }
+		PKG_UPDATED=0
+	fi
+
+	if [[ -f /var/log/auth.log || -f /var/log/secure ]]; then
+		:
+	elif [[ $INIT = systemd ]]; then
+		# debian 12 and others have no auth.log without rsyslog
+		backend=systemd
+		case $FAMILY in
+			debian) pkgs+=(python3-systemd) ;;
+			arch) pkgs+=(python-systemd) ;;
+		esac
+	elif [[ $FAMILY = alpine ]]; then
+		logpath=/var/log/messages
+	fi
+	action=$(f2b_banaction)
+	case $action in
+		nftables-multiport) pkgs+=(nftables); allports=nftables-allports ;;
+		iptables-multiport) allports=iptables-allports ;;
+	esac
+
+	pkg_install "${pkgs[@]}" || return 1
+	put_file /etc/fail2ban/jail.d/hardline.local 644 <<EOF
+# written by hardline
+[DEFAULT]
+bantime = 1h
+bantime.increment = true
+findtime = 10m
+maxretry = 5
+banaction = $action${allports:+
+banaction_allports = $allports}
+
+[sshd]
+enabled = true
+port = $SSH_PORT${backend:+
+backend = $backend}${logpath:+
+logpath = $logpath}
+EOF
+	svc enable fail2ban || return 1
+	[[ $INIT = systemd ]] && svc restart fail2ban
+	ok "fail2ban watching sshd on port $SSH_PORT"
+}
+
+setup_crowdsec() {
+	local bouncer=crowdsec-firewall-bouncer-nftables
+	case $FAMILY in
+		debian|rhel) ;;
+		*)
+			warn "crowdsec setup is only automated on apt and dnf systems, using fail2ban"
+			setup_fail2ban
+			return
+			;;
+	esac
+	case $(firewall_state) in ufw|iptables) bouncer=crowdsec-firewall-bouncer-iptables ;; esac
+
+	if ! pkg_has crowdsec; then
+		pkg_install curl || return 1
+		say "  adding the crowdsec package repository"
+		if [[ $DRY_RUN = 1 ]]; then
+			printf '  %s[dry-run]%s curl -fsSL https://install.crowdsec.net | sh\n' "$c_dim" "$c_off"
+		else
+			fetch https://install.crowdsec.net | sh >>"$LOGFILE" 2>&1 || { warn "crowdsec repo setup failed"; return 1; }
+		fi
+		PKG_UPDATED=0
+	fi
+	pkg_install crowdsec "$bouncer" || return 1
+	svc enable crowdsec || true
+	svc enable crowdsec-firewall-bouncer || true
+	ok "crowdsec running with $bouncer"
+}
+
+step_bruteforce() {
+	step "Brute force protection"
+	local tool=${OPT_BRUTE:-}
+	if [[ -z $tool ]]; then
+		if [[ $ASSUME_YES = 1 ]]; then
+			tool=fail2ban
+		else
+			tool=$(prompt "  fail2ban, crowdsec or none" fail2ban)
+		fi
+	fi
+	case $tool in
+		fail2ban) setup_fail2ban ;;
+		crowdsec) setup_crowdsec ;;
+		none) say "  skipped" ;;
+		*) warn "unknown choice: $tool"; return 1 ;;
+	esac
+}
+
 usage() {
 	cat <<EOF
 hardline $HARDLINE_VERSION - harden a fresh VPS
@@ -864,6 +1109,8 @@ main() {
 
 	run_step user step_user
 	run_step ssh step_ssh
+	run_step firewall step_firewall
+	run_step bruteforce step_bruteforce
 }
 
 main "$@"
