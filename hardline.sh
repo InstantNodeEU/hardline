@@ -130,6 +130,12 @@ put_file() {
 	log "wrote $path"
 }
 
+join() {
+	local IFS=, s
+	s="$*"
+	printf '%s' "${s//,/, }"
+}
+
 fetch() {
 	if command -v curl >/dev/null 2>&1; then
 		curl -fsSL --max-time 20 "$1"
@@ -386,21 +392,21 @@ bruteforce_state() {
 
 audit() {
 	local -n out=$1
-	out[ports]=$(listening_ports)
-	out[ports]=${out[ports]:-none}
-	out[ssh_port]=$(sshd_value Port)
-	out[root_login]=$(sshd_value PermitRootLogin)
-	out[password_auth]=$(sshd_value PasswordAuthentication)
-	out[login_users]=$(login_users)
-	out[empty_pw]=$(empty_pw_users)
-	out[empty_pw]=${out[empty_pw]:-none}
-	out[nopasswd]=$(nopasswd_sudo)
-	out[nopasswd]=${out[nopasswd]:-none}
-	out[firewall]=$(firewall_state)
-	out[updates]=$(pending_updates)
-	out[swap]="$(swap_mb) MB"
-	out[autoupdates]=$(autoupdates_state)
-	out[bruteforce]=$(bruteforce_state)
+	out["ports"]=$(listening_ports)
+	out["ports"]=${out["ports"]:-none}
+	out["ssh_port"]=$(sshd_value Port)
+	out["root_login"]=$(sshd_value PermitRootLogin)
+	out["password_auth"]=$(sshd_value PasswordAuthentication)
+	out["login_users"]=$(login_users)
+	out["empty_pw"]=$(empty_pw_users)
+	out["empty_pw"]=${out["empty_pw"]:-none}
+	out["nopasswd"]=$(nopasswd_sudo)
+	out["nopasswd"]=${out["nopasswd"]:-none}
+	out["firewall"]=$(firewall_state)
+	out["updates"]=$(pending_updates)
+	out["swap"]="$(swap_mb) MB"
+	out["autoupdates"]=$(autoupdates_state)
+	out["bruteforce"]=$(bruteforce_state)
 }
 
 AUDIT_KEYS=(ports ssh_port root_login password_auth login_users empty_pw nopasswd firewall bruteforce updates autoupdates swap)
@@ -675,7 +681,10 @@ step_ssh() {
 
 	cur_port=$SSH_PORT
 	new_port=${OPT_SSH_PORT:-$(prompt "  SSH port" "$cur_port")}
-	[[ $new_port =~ ^[0-9]+$ ]] && ((new_port > 0 && new_port < 65536)) || { warn "invalid port: $new_port"; return 1; }
+	if [[ ! $new_port =~ ^[0-9]+$ ]] || ((new_port < 1 || new_port > 65535)); then
+		warn "invalid port: $new_port"
+		return 1
+	fi
 
 	if [[ $DRY_RUN = 1 && -n $ADMIN_USER && -n $OPT_KEY$OPT_GITHUB ]]; then
 		keyuser=$ADMIN_USER
@@ -825,8 +834,8 @@ table inet hardline {
 		meta l4proto { icmp, icmpv6 } accept
 
 EOF
-	((${#tcp[@]})) && printf '\t\ttcp dport { %s } accept\n' "$(IFS=,; echo "${tcp[*]}" | sed 's/,/, /g')"
-	((${#udp[@]})) && printf '\t\tudp dport { %s } accept\n' "$(IFS=,; echo "${udp[*]}" | sed 's/,/, /g')"
+	((${#tcp[@]})) && printf '\t\ttcp dport { %s } accept\n' "$(join "${tcp[@]}")"
+	((${#udp[@]})) && printf '\t\tudp dport { %s } accept\n' "$(join "${udp[@]}")"
 	printf '\t}\n}\n'
 }
 
@@ -1017,6 +1026,316 @@ step_bruteforce() {
 	esac
 }
 
+# ---------------------------------------------------------------- updates
+
+is_dnf5() { dnf --version 2>/dev/null | head -n1 | grep -q dnf5; }
+
+upgrade_now() {
+	local n=${BEFORE[updates]}
+	[[ $n = 0 ]] && return 0
+	[[ $n = "?" ]] && n="all"
+	ask "Install $n pending update(s) now?" y || return 0
+	case $FAMILY in
+		debian)
+			pkg_refresh || return 1
+			run env DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confold upgrade
+			;;
+		rhel) run dnf -y -q upgrade ;;
+		arch) PKG_UPDATED=0; pkg_refresh ;;
+		alpine) run apk upgrade -q ;;
+		suse) run zypper -q -n update ;;
+	esac && ok "system is up to date"
+}
+
+step_updates() {
+	step "Updates"
+	upgrade_now || true
+	if [[ $OPT_UPDATES = 0 ]]; then
+		say "  skipped (--no-updates)"
+		return 0
+	fi
+	case $FAMILY in
+		debian)
+			ask "Install security updates automatically (unattended-upgrades)?" y || return 0
+			pkg_install unattended-upgrades || return 1
+			put_file /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+			if [[ $ASSUME_YES = 0 ]] && ask "  Reboot automatically at 04:00 when an update needs it?" n; then
+				put_file /etc/apt/apt.conf.d/52hardline-reboot <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+EOF
+			fi
+			ok "unattended-upgrades enabled"
+			;;
+		rhel)
+			ask "Install updates automatically (dnf-automatic)?" y || return 0
+			if is_dnf5; then
+				pkg_install dnf5-plugin-automatic || return 1
+				put_file /etc/dnf/automatic.conf <<'EOF'
+[commands]
+apply_updates = yes
+EOF
+				svc enable dnf5-automatic.timer || return 1
+			else
+				pkg_install dnf-automatic || return 1
+				svc enable dnf-automatic-install.timer || return 1
+			fi
+			ok "dnf-automatic enabled"
+			;;
+		alpine)
+			ask "Run apk upgrade daily from cron?" y || return 0
+			put_file /etc/periodic/daily/hardline-apk-upgrade 755 <<'EOF'
+#!/bin/sh
+apk update -q && apk upgrade -q
+EOF
+			svc enable crond || true
+			ok "daily apk upgrade enabled"
+			;;
+		arch)
+			say "  Arch is rolling release, unattended upgrades tend to break things there."
+			say "  Run pacman -Syu yourself every week or so."
+			note "arch: no automatic updates, upgrade manually"
+			;;
+		suse)
+			say "  not automated on openSUSE yet, look at transactional-update or os-update"
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------- swap
+
+# "2G" "512M" "1024" -> megabytes
+to_mb() {
+	local v=${1^^}
+	case $v in
+		*G) echo $(( ${v%G} * 1024 )) ;;
+		*M) echo "${v%M}" ;;
+		*) echo "$v" ;;
+	esac
+}
+
+step_swap() {
+	step "Swap"
+	local cur ram suggest size free fs
+	cur=$(swap_mb)
+	if ((cur > 0)); then
+		ok "swap already configured (${cur} MB)"
+		return 0
+	fi
+	[[ $OPT_SWAP = no ]] && { say "  skipped"; return 0; }
+
+	ram=$(ram_mb)
+	if ((ram < 2048)); then
+		suggest=$((ram * 2))
+	elif ((ram <= 8192)); then
+		suggest=$ram
+	else
+		suggest=4096
+	fi
+	size=$(to_mb "${OPT_SWAP:-$(prompt "  swapfile size in MB (RAM is ${ram} MB)" "$suggest")}")
+	if [[ ! $size =~ ^[0-9]+$ ]] || ((size < 64)); then
+		warn "invalid swap size: $size"
+		return 1
+	fi
+	ask "Create a ${size} MB swapfile at /swapfile?" y || return 0
+
+	free=$(df -Pm / | awk 'NR == 2 {print $4}')
+	if ((free < size + 1024)); then
+		warn "only ${free} MB free on /, not creating swap"
+		return 1
+	fi
+	if [[ -e /swapfile ]]; then
+		warn "/swapfile already exists but is not active, leaving it alone"
+		return 1
+	fi
+
+	fs=$(awk '$2 == "/" {fs = $3} END {print fs}' /proc/mounts)
+	case $fs in
+		btrfs)
+			if btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+				run btrfs filesystem mkswapfile --size "${size}M" /swapfile || return 1
+			else
+				# swap on btrfs needs a file without copy-on-write
+				run truncate -s 0 /swapfile
+				run chattr +C /swapfile
+				run fallocate -l "${size}M" /swapfile || return 1
+				run mkswap /swapfile
+			fi
+			;;
+		zfs)
+			warn "swapfiles on zfs are not supported, use a zvol instead"
+			return 1
+			;;
+		*)
+			run fallocate -l "${size}M" /swapfile || run dd if=/dev/zero of=/swapfile bs=1M count="$size" || return 1
+			run mkswap /swapfile
+			;;
+	esac
+	run chmod 600 /swapfile
+	if ! run swapon /swapfile; then
+		warn "swapon failed (container or unsupported filesystem?), removing /swapfile"
+		rm -f /swapfile
+		return 1
+	fi
+	if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+		backup /etc/fstab
+		if [[ $DRY_RUN = 0 ]]; then
+			echo "/swapfile none swap defaults 0 0" >>/etc/fstab
+			CHANGED+=(/etc/fstab)
+		fi
+	fi
+	put_file /etc/sysctl.d/90-hardline-swap.conf <<<"vm.swappiness = 10"
+	run sysctl -q -p /etc/sysctl.d/90-hardline-swap.conf || true
+	ok "${size} MB swap active"
+}
+
+# ---------------------------------------------------------------- extras
+
+current_tz() {
+	local tz=""
+	command -v timedatectl >/dev/null 2>&1 && tz=$(timedatectl show -p Timezone --value 2>/dev/null) || true
+	[[ -z $tz && -r /etc/timezone ]] && tz=$(cat /etc/timezone)
+	[[ -z $tz && -L /etc/localtime ]] && tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+	printf '%s' "${tz:-UTC}"
+}
+
+setup_ntp() {
+	if [[ $INIT = systemd ]] && command -v timedatectl >/dev/null 2>&1; then
+		if [[ $(timedatectl show -p NTP --value 2>/dev/null) = yes ]]; then
+			ok "time sync already on"
+			return 0
+		fi
+		run timedatectl set-ntp true && { ok "time sync enabled"; return 0; }
+	fi
+	[[ $INIT = none ]] && return 0
+	pkg_install chrony || return 1
+	case $FAMILY in
+		debian) svc enable chrony ;;
+		*) svc enable chronyd ;;
+	esac
+	ok "chrony enabled"
+}
+
+step_extras() {
+	step "Time and kernel settings"
+	local cur tz
+	cur=$(current_tz)
+	tz=${OPT_TZ:-$(prompt "  timezone" "$cur")}
+	if [[ $tz != "$cur" ]]; then
+		[[ -e /usr/share/zoneinfo/$tz ]] || pkg_install tzdata || true
+		if [[ ! -e /usr/share/zoneinfo/$tz ]]; then
+			warn "unknown timezone: $tz"
+		elif [[ $INIT = systemd ]] && command -v timedatectl >/dev/null 2>&1; then
+			run timedatectl set-timezone "$tz" && ok "timezone $tz"
+		else
+			run ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+			[[ -f /etc/timezone ]] && put_file /etc/timezone <<<"$tz"
+			ok "timezone $tz"
+		fi
+	fi
+
+	if ask "Make sure the clock is synced (NTP)?" y; then
+		setup_ntp || true
+	fi
+
+	if ask "Apply network sysctl hardening?" y; then
+		put_file /etc/sysctl.d/90-hardline.conf <<'EOF'
+# written by hardline
+net.ipv4.tcp_syncookies = 1
+# loose mode, strict breaks asymmetric routing on some providers
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+		if run sysctl -q -p /etc/sysctl.d/90-hardline.conf; then
+			ok "sysctl applied"
+		else
+			warn "could not apply sysctl now (container?), it will load on boot"
+		fi
+	fi
+}
+
+# ---------------------------------------------------------------- report
+
+render_report() {
+	local k b a st
+	printf '%-24s %-28s %-28s %s\n' "check" "before" "after" "state"
+	printf '%-24s %-28s %-28s %s\n' "-----" "------" "-----" "-----"
+	for k in "${AUDIT_KEYS[@]}"; do
+		b=${BEFORE[$k]}
+		a=${AFTER[$k]}
+		st=$(judge "$k" "$a")
+		if [[ $st = ok && $(judge "$k" "$b") != ok ]]; then
+			st=fixed
+		fi
+		printf '%-24s %-28s %-28s %s\n' "${LABEL[$k]}" "$(short "$b" 27)" "$(short "$a" 27)" "$(paint "$st")"
+	done
+}
+
+report() {
+	local still=() k
+	step "Report"
+	render_report | sed 's/^/  /'
+
+	for k in "${AUDIT_KEYS[@]}"; do
+		[[ $(judge "$k" "${AFTER[$k]}") = open ]] && still+=("${LABEL[$k]}")
+	done
+	echo
+	if ((${#still[@]})); then
+		warn "still open: $(join "${still[@]}")"
+	else
+		ok "nothing obvious left open"
+	fi
+
+	if [[ $DRY_RUN = 1 ]]; then
+		say "  dry run, no report written"
+		return 0
+	fi
+
+	(
+		umask 077
+		c_red="" c_grn="" c_yel="" c_off=""
+		{
+			echo "hardline $HARDLINE_VERSION report"
+			echo "host:  $(hostname 2>/dev/null || cat /etc/hostname)"
+			echo "os:    $OS_NAME"
+			echo "date:  $(date '+%F %T %Z')"
+			echo
+			render_report
+			echo
+			echo "listening ports before: ${BEFORE[ports]}"
+			echo "listening ports after:  ${AFTER[ports]}"
+			if ((${#CHANGED[@]})); then
+				echo
+				echo "changed files (originals saved as <file>.hardline.bak):"
+				printf '  %s\n' "${CHANGED[@]}" | sort -u
+			fi
+			if ((${#NOTES[@]})); then
+				echo
+				echo "notes:"
+				printf '  %s\n' "${NOTES[@]}"
+			fi
+			if [[ -n $GENERATED_PW ]]; then
+				echo
+				echo "generated sudo password for $ADMIN_USER: $GENERATED_PW"
+				echo "change it with: passwd $ADMIN_USER"
+			fi
+		} >"$REPORT"
+	)
+	say "  report saved to $REPORT"
+	say "  log: $LOGFILE"
+}
+
 usage() {
 	cat <<EOF
 hardline $HARDLINE_VERSION - harden a fresh VPS
@@ -1111,6 +1430,12 @@ main() {
 	run_step ssh step_ssh
 	run_step firewall step_firewall
 	run_step bruteforce step_bruteforce
+	run_step updates step_updates
+	run_step swap step_swap
+	run_step extras step_extras
+
+	audit AFTER
+	report
 }
 
 main "$@"
