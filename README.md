@@ -12,14 +12,14 @@ you can leave on the internet. It's one bash script that asks before every
 change, and at the end it shows you what was open before and what is closed now.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/instantnode/hardline/main/hardline.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/instantnodeeu/hardline/main/hardline.sh | sudo bash
 ```
 
 Piping into bash still works interactively, questions are read from `/dev/tty`.
 If you'd rather read it first (you should):
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/instantnode/hardline/main/hardline.sh
+curl -fsSLO https://raw.githubusercontent.com/instantnodeeu/hardline/main/hardline.sh
 less hardline.sh
 sudo bash hardline.sh --dry-run
 ```
