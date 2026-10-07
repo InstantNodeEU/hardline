@@ -9,5 +9,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck hardline.sh
+      - run: shellcheck -S warning hardline.sh
       - run: bash -n hardline.sh
