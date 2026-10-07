@@ -470,6 +470,308 @@ print_audit() {
 	done
 }
 
+# ---------------------------------------------------------------- admin user
+
+# add_keys USER < lines. Strips options like command="..." that cloud
+# images put in front of root's keys.
+add_keys() {
+	local user=$1 home file line key added=0 known=0
+	home=$(user_home "$user")
+	file=$home/.ssh/authorized_keys
+	while IFS= read -r line; do
+		key=$(grep -oE "$KEY_RE( .*)?\$" <<<"$line" || true)
+		[[ -n $key ]] || continue
+		if [[ -f $file ]] && grep -qF "$(cut -d' ' -f2 <<<"$key")" "$file"; then
+			known=$((known + 1))
+			continue
+		fi
+		added=$((added + 1))
+		if [[ $DRY_RUN = 1 ]]; then
+			printf '  %s[dry-run]%s add key %s\n' "$c_dim" "$c_off" "$(short "$key" 50)"
+			continue
+		fi
+		mkdir -p "$home/.ssh"
+		printf '%s\n' "$key" >>"$file"
+	done
+	if ((added == 0 && known > 0)); then
+		ok "key already present for $user"
+		return 0
+	elif ((added == 0)); then
+		warn "no valid public key found"
+		return 1
+	fi
+	if [[ $DRY_RUN = 0 ]]; then
+		chmod 700 "$home/.ssh"
+		chmod 600 "$file"
+		chown -R "$user:$(id -gn "$user")" "$home/.ssh"
+		command -v restorecon >/dev/null 2>&1 && restorecon -R "$home/.ssh" 2>/dev/null
+		CHANGED+=("$file")
+	fi
+	ok "$added key(s) added for $user"
+}
+
+import_github_keys() {
+	local user=$1 gh=$2 keys
+	[[ $gh =~ ^[A-Za-z0-9-]+$ ]] || { warn "not a valid github username: $gh"; return 1; }
+	keys=$(fetch "https://github.com/$gh.keys") || { warn "could not fetch keys for $gh"; return 1; }
+	[[ -n $keys ]] || { warn "github user $gh has no public keys"; return 1; }
+	add_keys "$user" <<<"$keys"
+}
+
+pick_keys() {
+	local user=$1 choice root_keys=0 k gh
+	[[ -f /root/.ssh/authorized_keys ]] && root_keys=$(grep -cE "$KEY_RE" /root/.ssh/authorized_keys || true)
+	while true; do
+		echo "  Add an SSH key for $user:"
+		echo "    1) paste a public key"
+		echo "    2) import from a GitHub account"
+		[[ $root_keys -gt 0 ]] && echo "    3) copy root's keys ($root_keys found)"
+		echo "    s) skip"
+		choice=$(prompt "  choice" "$([[ $root_keys -gt 0 ]] && echo 3 || echo 1)")
+		case $choice in
+			1) k=$(prompt "  public key"); add_keys "$user" <<<"$k" || true ;;
+			2) gh=$(prompt "  GitHub username"); import_github_keys "$user" "$gh" || true ;;
+			3) add_keys "$user" </root/.ssh/authorized_keys || true ;;
+			s|S) return 0 ;;
+			*) continue ;;
+		esac
+		ask "  Add another key?" n || return 0
+	done
+}
+
+set_password() {
+	local user=$1 shadow_pw
+	shadow_pw=$(awk -F: -v u="$user" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+	if [[ -n $shadow_pw && $shadow_pw != "!"* && $shadow_pw != "*"* ]]; then
+		return 0
+	fi
+	[[ $DRY_RUN = 1 ]] && { printf '  %s[dry-run]%s set password for %s\n' "$c_dim" "$c_off" "$user"; return 0; }
+
+	# sudo needs a password, and on alpine a locked account can't log in at all
+	if [[ $ASSUME_YES = 0 ]] && ask "  Set a password for $user now? (no = generate one)" y; then
+		local tries=0
+		until passwd "$user" </dev/tty >/dev/tty 2>&1; do
+			tries=$((tries + 1))
+			((tries < 3)) || break
+		done
+		((tries < 3)) && return 0
+	fi
+	GENERATED_PW=$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-20)
+	printf '%s:%s\n' "$user" "$GENERATED_PW" | chpasswd
+	log "generated password for $user"
+	warn "generated password for $user: $GENERATED_PW (change it with passwd)"
+}
+
+enable_wheel() {
+	[[ $FAMILY = debian || $FAMILY = rhel ]] && return 0
+	grep -qsE '^[[:space:]]*%wheel[[:space:]]+ALL' /etc/sudoers /etc/sudoers.d/* && return 0
+	put_file /etc/sudoers.d/10-hardline-wheel 440 <<<"%wheel ALL=(ALL:ALL) ALL"
+	if [[ $DRY_RUN = 0 ]] && ! visudo -cf /etc/sudoers.d/10-hardline-wheel >/dev/null 2>&1; then
+		rm -f /etc/sudoers.d/10-hardline-wheel
+		warn "sudoers drop-in did not validate, removed it"
+	fi
+}
+
+step_user() {
+	step "Admin user"
+	local name existing group shell
+	existing=$(sudo_users)
+	if [[ -n $OPT_USER ]]; then
+		name=$OPT_USER
+	elif [[ $ASSUME_YES = 1 ]]; then
+		say "  no --user given, skipping"
+		return 0
+	else
+		[[ -n $existing ]] && say "  existing sudo users: $existing"
+		ask "Create or update a non-root admin user?" y || return 0
+		name=$(prompt "  username" "${existing%% *}")
+		name=${name:-admin}
+	fi
+	[[ $name =~ ^[a-z_][a-z0-9_-]{0,31}$ && $name != root ]] || { warn "invalid username: $name"; return 1; }
+
+	group=$(sudo_group)
+	shell=$(command -v bash)
+	pkg_install sudo || return 1
+
+	if user_exists "$name"; then
+		say "  $name exists, making sure it is in $group"
+		if [[ $FAMILY = alpine ]]; then
+			id -nG "$name" | grep -qw "$group" || run addgroup "$name" "$group"
+		else
+			run usermod -aG "$group" "$name"
+		fi
+	else
+		if [[ $FAMILY = alpine ]]; then
+			run adduser -D -s "$shell" "$name" && run addgroup "$name" "$group"
+		else
+			run useradd -m -s "$shell" -G "$group" "$name"
+		fi || return 1
+		ok "created user $name"
+	fi
+	enable_wheel
+	ADMIN_USER=$name
+
+	if [[ $DRY_RUN = 1 ]] && ! user_exists "$name"; then
+		printf '  %s[dry-run]%s set password and add keys for %s\n' "$c_dim" "$c_off" "$name"
+		return 0
+	fi
+	set_password "$name"
+
+	[[ -n $OPT_KEY ]] && { add_keys "$name" <<<"$OPT_KEY" || true; }
+	[[ -n $OPT_GITHUB ]] && { import_github_keys "$name" "$OPT_GITHUB" || true; }
+	[[ $OPT_COPY_ROOT_KEYS = 1 && -f /root/.ssh/authorized_keys ]] && { add_keys "$name" </root/.ssh/authorized_keys || true; }
+	if [[ $ASSUME_YES = 0 && -z $OPT_KEY$OPT_GITHUB && $OPT_COPY_ROOT_KEYS = 0 ]]; then
+		pick_keys "$name"
+	fi
+	user_has_key "$name" || warn "$name has no SSH key yet, password login will stay on"
+}
+
+# ---------------------------------------------------------------- ssh
+
+openssh_version() {
+	ssh -V 2>&1 | sed -nE 's/^OpenSSH_([0-9]+)\.([0-9]+).*/\1\2/p' | head -n1
+}
+
+ssh_service() {
+	if [[ $INIT = systemd ]] && systemctl cat ssh.service >/dev/null 2>&1; then
+		echo ssh
+	else
+		echo sshd
+	fi
+}
+
+# Make sure the new port is reachable before sshd moves there.
+fw_open_port() {
+	local port=$1
+	case $(firewall_state) in
+		ufw) run ufw allow "$port/tcp" ;;
+		firewalld) run firewall-cmd --permanent --add-port="$port/tcp" && run firewall-cmd --reload ;;
+		nftables)
+			if nft list table inet hardline >/dev/null 2>&1; then
+				run nft add rule inet hardline input tcp dport "$port" accept
+			else
+				warn "nftables already filters input, make sure tcp/$port is allowed"
+			fi
+			;;
+		iptables) run iptables -I INPUT -p tcp --dport "$port" -j ACCEPT ;;
+	esac
+}
+
+selinux_ssh_port() {
+	local port=$1
+	command -v getenforce >/dev/null 2>&1 || return 0
+	[[ $(getenforce 2>/dev/null) = Disabled ]] && return 0
+	command -v semanage >/dev/null 2>&1 || pkg_install policycoreutils-python-utils || return 1
+	run semanage port -a -t ssh_port_t -p tcp "$port" || run semanage port -m -t ssh_port_t -p tcp "$port"
+}
+
+step_ssh() {
+	step "SSH"
+	if ! command -v sshd >/dev/null 2>&1; then
+		say "  sshd is not installed, skipping"
+		return 0
+	fi
+	local cur_port new_port root_mode="" pass_mode="" u keyuser="" conf=/etc/ssh/sshd_config.d/00-hardline.conf main=/etc/ssh/sshd_config
+
+	cur_port=$SSH_PORT
+	new_port=${OPT_SSH_PORT:-$(prompt "  SSH port" "$cur_port")}
+	[[ $new_port =~ ^[0-9]+$ ]] && ((new_port > 0 && new_port < 65536)) || { warn "invalid port: $new_port"; return 1; }
+
+	if [[ $DRY_RUN = 1 && -n $ADMIN_USER && -n $OPT_KEY$OPT_GITHUB ]]; then
+		keyuser=$ADMIN_USER
+	fi
+	for u in $ADMIN_USER $(sudo_users); do
+		[[ -n $keyuser ]] && break
+		[[ $u = root ]] && continue
+		if user_has_key "$u"; then keyuser=$u; break; fi
+	done
+	if [[ -n $keyuser ]]; then
+		root_mode=no
+		pass_mode=no
+	elif user_has_key root; then
+		root_mode=prohibit-password
+		pass_mode=no
+		warn "no admin user with a key, root keeps key-only login"
+	else
+		warn "no SSH keys found for root or any sudo user"
+		warn "password login stays enabled so you don't lock yourself out"
+	fi
+
+	say "  planned: port $new_port${root_mode:+, PermitRootLogin $root_mode}${pass_mode:+, PasswordAuthentication $pass_mode}"
+	ask "Apply SSH settings?" y || return 0
+
+	if ! grep -qsE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$main"; then
+		backup "$main"
+		if [[ $DRY_RUN = 0 ]]; then
+			{ echo "Include /etc/ssh/sshd_config.d/*.conf"; cat "$main.hardline.bak"; } >"$main"
+			CHANGED+=("$main")
+		else
+			printf '  %s[dry-run]%s add Include line to %s\n' "$c_dim" "$c_off" "$main"
+		fi
+	fi
+
+	# Port is additive in sshd, a second Port line would keep 22 open
+	if [[ $new_port != "$cur_port" ]] && grep -qE '^[[:space:]]*Port[[:space:]]' "$main"; then
+		backup "$main"
+		run sed -i -E 's/^([[:space:]]*Port[[:space:]])/#\1/' "$main"
+		CHANGED+=("$main")
+	fi
+
+	local kbd=KbdInteractiveAuthentication ver
+	ver=$(openssh_version || true)
+	((${ver:-0} < 87)) && kbd=ChallengeResponseAuthentication
+
+	put_file "$conf" 600 < <(
+		echo "# written by hardline, original files are kept as *.hardline.bak"
+		[[ $new_port != 22 || $cur_port != 22 ]] && echo "Port $new_port"
+		[[ -n $root_mode ]] && echo "PermitRootLogin $root_mode"
+		if [[ -n $pass_mode ]]; then
+			echo "PasswordAuthentication $pass_mode"
+			echo "$kbd no"
+		fi
+		echo "PubkeyAuthentication yes"
+		echo "MaxAuthTries 4"
+		echo "X11Forwarding no"
+	)
+
+	[[ $DRY_RUN = 0 && $FAMILY = debian ]] && mkdir -p /run/sshd
+	if [[ $DRY_RUN = 0 ]] && ! sshd -t 2>>"$LOGFILE"; then
+		warn "sshd -t failed, rolling back ssh changes"
+		rm -f "$conf"
+		[[ -f $main.hardline.bak ]] && cp -a "$main.hardline.bak" "$main"
+		return 1
+	fi
+
+	if [[ $new_port != "$cur_port" ]]; then
+		fw_open_port "$new_port" || true
+		selinux_ssh_port "$new_port" || warn "could not label port $new_port for selinux, sshd may fail to bind"
+	fi
+
+	if [[ $INIT = systemd ]] && systemctl is-active --quiet ssh.socket 2>/dev/null; then
+		# ubuntu 22.10+ socket activation takes the port from a generator
+		run systemctl daemon-reload
+		run systemctl restart ssh.socket
+	else
+		svc reload "$(ssh_service)" || svc restart "$(ssh_service)" || true
+	fi
+	SSH_PORT=$new_port
+	ok "sshd configured"
+
+	if [[ $DRY_RUN = 0 && $INIT != none ]]; then
+		echo
+		say "  ${c_bold}Keep this session open.${c_off} Test from a second terminal:"
+		say "    ssh -p $new_port ${keyuser:-root}@$(server_ip)"
+		if [[ $ASSUME_YES = 0 ]] && ! ask "Did the new login work?" y; then
+			warn "rolling back ssh changes"
+			rm -f "$conf"
+			[[ -f $main.hardline.bak ]] && cp -a "$main.hardline.bak" "$main"
+			svc reload "$(ssh_service)" || svc restart "$(ssh_service)" || true
+			SSH_PORT=$cur_port
+			return 1
+		fi
+	fi
+}
+
 usage() {
 	cat <<EOF
 hardline $HARDLINE_VERSION - harden a fresh VPS
@@ -559,6 +861,9 @@ main() {
 	ask "Start hardening?" y || exit 0
 	SSH_PORT=${BEFORE[ssh_port]}
 	[[ $SSH_PORT =~ ^[0-9]+$ ]] || SSH_PORT=22
+
+	run_step user step_user
+	run_step ssh step_ssh
 }
 
 main "$@"
