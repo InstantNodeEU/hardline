@@ -1,9 +1,10 @@
-<p align="center"><img src="https://bench.instantnode.eu/oss/hardline/banner.png" alt="hardline" width="100%"></p>
+<p align="center"><img src="assets/banner.png" alt="hardline" width="100%"></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-f85149?style=flat-square" alt="license MIT">
   <img src="https://img.shields.io/badge/written%20in-Bash-f85149?style=flat-square" alt="Bash">
-  <img src="https://img.shields.io/badge/platform-linux-f85149?style=flat-square" alt="linux">
+  <a href="https://github.com/instantnodeeu/hardline/releases"><img src="https://img.shields.io/github/v/release/instantnodeeu/hardline?style=flat-square&color=f85149" alt="release"></a>
+  <a href="https://github.com/instantnodeeu/hardline/stargazers"><img src="https://img.shields.io/github/stars/instantnodeeu/hardline?style=flat-square&color=f85149" alt="stars"></a>
   <a href="https://instantnode.eu"><img src="https://img.shields.io/badge/by-InstantNode-f85149?style=flat-square" alt="by InstantNode"></a>
 </p>
 
@@ -24,7 +25,7 @@ less hardline.sh
 sudo bash hardline.sh --dry-run
 ```
 
-<p align="center"><img src="https://bench.instantnode.eu/oss/hardline/screenshot-run.png" alt="interactive run" width="760"></p>
+<p align="center"><img src="assets/screenshot-run.png" alt="interactive run" width="760"></p>
 
 ## What it does
 
@@ -57,7 +58,7 @@ Every step can be skipped. In order:
 9. **Report.** Before/after table in the terminal and in
    `/root/hardline-report-<date>.txt`.
 
-<p align="center"><img src="https://bench.instantnode.eu/oss/hardline/screenshot-report.png" alt="before/after report" width="760"></p>
+<p align="center"><img src="assets/screenshot-report.png" alt="before/after report" width="760"></p>
 
 ## Supported systems
 
