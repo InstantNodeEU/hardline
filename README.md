@@ -62,6 +62,13 @@ Every step can be skipped. In order:
 | Alpine | Alpine 3.2x | needs `apk add bash curl` first, OpenRC |
 | openSUSE | | best effort |
 
+So far every run has been in containers without an init system (Debian 12,
+Ubuntu 24.04, AlmaLinux 9, Arch, Alpine, each once with `--dry-run` and twice
+for real). That covers package installs, config files, the sshd check, the
+nftables ruleset and the report. Enabling services under systemd/OpenRC, the
+sshd reload and crowdsec haven't been exercised on a real VM yet. Reports from
+real machines are welcome.
+
 ## Options
 
 | Flag | |
