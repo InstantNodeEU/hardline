@@ -26,6 +26,16 @@ less hardline.sh
 sudo bash hardline.sh --dry-run
 ```
 
+To keep it around as a `hardline` command, for a re-run after the next distro
+upgrade or a `--dry-run` check now and then:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/instantnodeeu/hardline/main/install.sh | sudo sh
+sudo hardline --dry-run
+```
+
+Run the install line again to update it.
+
 <p align="center"><img src="assets/screenshot-run.png" alt="interactive run" width="760"></p>
 
 ## What it does
